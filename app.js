@@ -41,7 +41,7 @@ async function fetchAllPokemon() {
   return allRows;
 }
 
-// Paginated tally fetch
+// Paginated tally fetch for a specific question/variable pair
 async function fetchTalliesForQuestion(questionId, varVal) {
   let allTallies = [];
   let page = 0;
@@ -251,7 +251,7 @@ async function handleGuessResult(isCorrect) {
   if (isCorrect) {
     console.log(`🎉 [Win] Successfully guessed ${currentGuess.name.toUpperCase()} in ${turnCount} turns!`);
 
-    // Build RPC payload from session history to reinforce correct answers
+    // Reinforce database tallies on correct guess
     const payload = sessionHistory.map(entry => ({
       pokemon_id: currentGuess.pokemon_id,
       question_id: entry.question_id,
@@ -293,10 +293,7 @@ async function handleGuessResult(isCorrect) {
 
 function promptForCorrectPokemon(titleReason) {
   console.log("📝 [Feedback Prompt] Presenting Pokémon selection UI to update tallies...");
-  
-  // Sort list alphabetically for easier scrolling
   const sortedOptions = [...allPokemonMasterList].sort((a, b) => a.name.localeCompare(b.name));
-  
   let optionsHTML = sortedOptions.map(p => `<option value="${p.pokemon_id}">${p.name.replace(/-/g, ' ').toUpperCase()}</option>`).join('');
 
   document.getElementById("game-area").innerHTML = `
@@ -318,7 +315,6 @@ async function submitTargetPokemonCorrection() {
 
   document.getElementById("game-area").innerHTML = `<div class="guess-box">Updating tallies for ${name}...</div>`;
 
-  // Build RPC payload from session history
   const payload = sessionHistory.map(entry => ({
     pokemon_id: selectedPokemonId,
     question_id: entry.question_id,
@@ -344,12 +340,52 @@ async function submitTargetPokemonCorrection() {
   `;
 }
 
+// Scans the full master list against session history and revives candidates with lowest mismatches
+async function reviveCandidatesFromHistory() {
+  console.warn("🔄 [Backtrack Engine] Candidate pool hit 0! Scanning master list for candidates with closest match...");
+  
+  const historyTallies = await Promise.all(
+    sessionHistory.map(async (entry) => {
+      const tallies = await fetchTalliesForQuestion(entry.question_id, entry.variable_value);
+      const map = new Map(tallies.map(t => [t.pokemon_id, t]));
+      return { entry, map };
+    })
+  );
+
+  const scoredPokemon = allPokemonMasterList.map(p => {
+    let mismatches = 0;
+
+    for (const { entry, map } of historyTallies) {
+      const tally = map.get(p.pokemon_id);
+      if (!tally) continue;
+
+      const total = tally.yes_count + tally.no_count;
+      const yesRatio = total > 0 ? tally.yes_count / total : 0.5;
+      const expectedAnswer = yesRatio >= 0.5 ? 'yes' : 'no';
+
+      if (entry.userChoice !== expectedAnswer) {
+        mismatches++;
+      }
+    }
+
+    return { pokemon: p, mismatches };
+  });
+
+  const minMismatches = Math.min(...scoredPokemon.map(sp => sp.mismatches));
+  console.log(`🔍 [Backtrack Engine] Minimum mismatches found across master list: ${minMismatches}`);
+
+  const revived = scoredPokemon
+    .filter(sp => sp.mismatches <= minMismatches)
+    .map(sp => sp.pokemon);
+
+  return revived;
+}
+
 async function submitAnswer(userChoice) {
   if (!currentQuestion) return;
 
   console.log(`👉 [User Answer] Question Q${currentQuestion.question_id} (${currentQuestion.variable_value}) -> Choice: ${userChoice.toUpperCase()}`);
 
-  // Track in session history for database feedback
   if (userChoice !== 'dont_know') {
     sessionHistory.push({
       question_id: currentQuestion.question_id,
@@ -368,7 +404,7 @@ async function submitAnswer(userChoice) {
     const targetMap = new Map(tallyData.map(t => [t.pokemon_id, t]));
     const prevCount = alivePokemon.length;
 
-    alivePokemon = alivePokemon.filter(p => {
+    const filtered = alivePokemon.filter(p => {
       const tally = targetMap.get(p.pokemon_id);
       if (!tally) return true;
 
@@ -377,10 +413,21 @@ async function submitAnswer(userChoice) {
       return userChoice === 'yes' ? yesRatio >= 0.5 : yesRatio < 0.5;
     });
 
-    console.log(`📉 [Candidate Filter] Reduced alive candidates from ${prevCount} down to ${alivePokemon.length}.`);
+    if (filtered.length === 0) {
+      console.warn(`⚠️ [Filter Wipeout] Q${currentQuestion.question_id} reduced alive pool to 0! Triggering Backtrack Engine...`);
+      document.getElementById("candidate-count").innerText = `Alive Candidates: Re-evaluating previous answers...`;
+
+      alivePokemon = await reviveCandidatesFromHistory();
+
+      console.log(`✨ [Backtrack Complete] Resurrected ${alivePokemon.length} candidate(s) with lowest mismatch score!`);
+      document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length} (Revived from backtrack)`;
+    } else {
+      alivePokemon = filtered;
+      console.log(`📉 [Candidate Filter] Reduced alive candidates from ${prevCount} down to ${alivePokemon.length}.`);
+      document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
+    }
   }
 
-  document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
   nextQuestion();
 }
 
