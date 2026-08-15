@@ -1,7 +1,8 @@
 const SUPABASE_URL = "https://yckzsnehkugfvecbwheq.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_y2Tika1SdQUWXwyQKyB7AA_6sH2ef-g"; // Use the public anon key here!
 
-const supabaseClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Create the client instance under 'dbClient'
+const dbClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let alivePokemon = [];
 let questions = [];
@@ -11,17 +12,20 @@ let currentQuestion = null;
 async function initGame() {
   document.getElementById("question-text").innerText = "Downloading decision database...";
   
-  // 1. Fetch all Pokemon IDs
-  const { data: pData } = await supabase.from('pokemon').select('pokemon_id, name');
-  alivePokemon = pData;
+  // 1. Fetch all Pokemon IDs using dbClient
+  const { data: pData, error: pErr } = await dbClient.from('pokemon').select('pokemon_id, name');
+  if (pErr) console.error("Pokemon Fetch Error:", pErr);
+  alivePokemon = pData || [];
 
-  // 2. Fetch all Question templates
-  const { data: qData } = await supabase.from('questions').select('*').eq('enabled_in_game', true);
-  questions = qData;
+  // 2. Fetch all Question templates using dbClient
+  const { data: qData, error: qErr } = await dbClient.from('questions').select('*').eq('enabled_in_game', true);
+  if (qErr) console.error("Questions Fetch Error:", qErr);
+  questions = qData || [];
 
-  // 3. Fetch variables
-  const { data: vData } = await supabase.from('question_variables').select('*');
-  questionVariables = vData;
+  // 3. Fetch variables using dbClient
+  const { data: vData, error: vErr } = await dbClient.from('question_variables').select('*');
+  if (vErr) console.error("Variables Fetch Error:", vErr);
+  questionVariables = vData || [];
 
   document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
   nextQuestion();
@@ -31,6 +35,11 @@ async function nextQuestion() {
   if (alivePokemon.length <= 1) {
     const winner = alivePokemon[0] ? alivePokemon[0].name.toUpperCase() : "Unknown";
     document.getElementById("game-area").innerHTML = `<div class="guess-box">I guess: ${winner}!</div>`;
+    return;
+  }
+
+  if (questions.length === 0) {
+    document.getElementById("question-text").innerText = "Error loading question bank.";
     return;
   }
 
@@ -53,12 +62,16 @@ async function nextQuestion() {
 }
 
 async function submitAnswer(userChoice) {
-  // Query Supabase for tallies matching this question
-  const { data: tallyData } = await supabase
+  if (!currentQuestion) return;
+
+  // Query tallies matching this question using dbClient
+  const { data: tallyData, error: tErr } = await dbClient
     .from('pokemon_question_tallies')
     .select('pokemon_id, yes_count, no_count')
     .eq('question_id', currentQuestion.question_id)
     .eq('variable_value', currentQuestion.variable_value);
+
+  if (tErr) console.error("Tally Fetch Error:", tErr);
 
   if (tallyData && userChoice !== 'dont_know') {
     const targetMap = new Map(tallyData.map(t => [t.pokemon_id, t]));
@@ -66,9 +79,10 @@ async function submitAnswer(userChoice) {
     // Filter alive Pokemon based on user answer
     alivePokemon = alivePokemon.filter(p => {
       const tally = targetMap.get(p.pokemon_id);
-      if (!tally) return true; // Keep if no data yet
+      if (!tally) return true; // Keep if no data recorded
 
-      const yesRatio = tally.yes_count / (tally.yes_count + tally.no_count || 1);
+      const total = tally.yes_count + tally.no_count;
+      const yesRatio = total > 0 ? tally.yes_count / total : 0.5;
       return userChoice === 'yes' ? yesRatio >= 0.5 : yesRatio < 0.5;
     });
   }
