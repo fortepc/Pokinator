@@ -250,8 +250,29 @@ function makeGuess() {
 async function handleGuessResult(isCorrect) {
   if (isCorrect) {
     console.log(`🎉 [Win] Successfully guessed ${currentGuess.name.toUpperCase()} in ${turnCount} turns!`);
+
+    // Build RPC payload from session history to reinforce correct answers
+    const payload = sessionHistory.map(entry => ({
+      pokemon_id: currentGuess.pokemon_id,
+      question_id: entry.question_id,
+      variable_value: entry.variable_value,
+      yes_count: entry.userChoice === 'yes' ? 10 : 0,
+      no_count: entry.userChoice === 'no' ? 10 : 0
+    }));
+
+    if (payload.length > 0) {
+      console.log(`⬆️ [Win Feedback] Reinforcing ${payload.length} tallies for ${currentGuess.name.toUpperCase()} in Supabase...`, payload);
+      const { error } = await dbClient.rpc("add_tallies", { payload });
+      if (error) {
+        console.error("❌ [Database Error] Failed to update win tallies:", error);
+      } else {
+        console.log("✅ [Database Updated] Win tallies successfully saved!");
+      }
+    }
+
     document.getElementById("game-area").innerHTML = `
       <div class="guess-box" style="color: #4ade80;">I guessed it in ${turnCount} questions!</div>
+      <p style="margin-top: 0.5rem; font-size: 0.9rem; color: #888;">Saved ${payload.length} answer tallies for ${currentGuess.name.toUpperCase()}.</p>
       <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
     `;
   } else {
