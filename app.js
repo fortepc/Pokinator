@@ -4,6 +4,7 @@ const SUPABASE_ANON_KEY = "sb_publishable_y2Tika1SdQUWXwyQKyB7AA_6sH2ef-g";
 const dbClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let alivePokemon = [];
+let allPokemonMasterList = [];
 let questions = [];
 let questionVariables = [];
 let currentQuestion = null;
@@ -12,9 +13,11 @@ let turnCount = 0;
 let maxQuestionsThreshold = 25;
 
 const askedQuestions = new Set();
+const sessionHistory = []; // Stores { question_id, variable_value, userChoice }
 
 // Paginated fetch to bypass Supabase's default 1,000-row API cap
 async function fetchAllPokemon() {
+  console.log("🌐 [Init] Starting paginated fetch for master Pokémon list...");
   let allRows = [];
   let page = 0;
   const pageSize = 1000;
@@ -23,8 +26,15 @@ async function fetchAllPokemon() {
       .from('pokemon')
       .select('pokemon_id, name')
       .range(page * pageSize, (page + 1) * pageSize - 1);
-    if (error || !data || data.length === 0) break;
+    
+    if (error) {
+      console.error(`❌ [Init] Fetch error on page ${page}:`, error);
+      break;
+    }
+    if (!data || data.length === 0) break;
+    
     allRows = allRows.concat(data);
+    console.log(`📦 [Init] Loaded page ${page + 1} (${data.length} items). Total so far: ${allRows.length}`);
     if (data.length < pageSize) break;
     page++;
   }
@@ -43,6 +53,7 @@ async function fetchTalliesForQuestion(questionId, varVal) {
       .eq('question_id', questionId)
       .eq('variable_value', varVal)
       .range(page * pageSize, (page + 1) * pageSize - 1);
+      
     if (error || !data || data.length === 0) break;
     allTallies = allTallies.concat(data);
     if (data.length < pageSize) break;
@@ -57,20 +68,21 @@ async function initGame() {
   turnCount = 0;
   maxQuestionsThreshold = 25;
   askedQuestions.clear();
+  sessionHistory.length = 0;
   
-  // Fetch ALL Pokemon (bypasses 1,000 row cap)
-  alivePokemon = await fetchAllPokemon();
+  console.log("🚀 [Game Start] Initializing game session...");
+  allPokemonMasterList = await fetchAllPokemon();
+  alivePokemon = [...allPokemonMasterList];
 
-  // Fetch enabled questions
   const { data: qData, error: qErr } = await dbClient.from('questions').select('*').eq('enabled_in_game', true);
-  if (qErr) console.error("Questions Fetch Error:", qErr);
+  if (qErr) console.error("❌ [Init] Questions Fetch Error:", qErr);
   questions = qData || [];
 
-  // Fetch variables
   const { data: vData, error: vErr } = await dbClient.from('question_variables').select('*');
-  if (vErr) console.error("Variables Fetch Error:", vErr);
+  if (vErr) console.error("❌ [Init] Variables Fetch Error:", vErr);
   questionVariables = vData || [];
 
+  console.log(`✅ [Init Complete] ${alivePokemon.length} candidate Pokémon, ${questions.length} question templates loaded.`);
   document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
   nextQuestion();
 }
@@ -88,9 +100,10 @@ function restoreGameUI() {
 
 async function nextQuestion() {
   turnCount++;
+  console.log(`\n--- 🔄 [Turn ${turnCount}] Alive Candidates: ${alivePokemon.length} ---`);
 
-  // Trigger guess if 1 candidate remains or question threshold is reached
   if (alivePokemon.length <= 1 || turnCount > maxQuestionsThreshold) {
+    console.log("🎯 [Decision] Candidate count threshold met. Triggering guess phase.");
     makeGuess();
     return;
   }
@@ -105,15 +118,11 @@ async function nextQuestion() {
       const matchingVars = questionVariables.filter(v => v.category === q.variable_category);
       for (const v of matchingVars) {
         const key = `${q.question_id}_${v.variable_value}`;
-        if (!askedQuestions.has(key)) {
-          unusedVars.push(v);
-        }
+        if (!askedQuestions.has(key)) unusedVars.push(v);
       }
     } else {
       const key = `${q.question_id}_none`;
-      if (!askedQuestions.has(key)) {
-        unusedVars.push(null);
-      }
+      if (!askedQuestions.has(key)) unusedVars.push(null);
     }
 
     if (unusedVars.length > 0) {
@@ -122,13 +131,13 @@ async function nextQuestion() {
   }
 
   if (availableTemplates.length === 0) {
+    console.log("⚠️ [Entropy] No unused questions left. Forcing guess.");
     makeGuess();
     return;
   }
 
-  // 2. Sample across DISTINCT question templates
+  // 2. Sample distinct question templates
   const sampledTemplates = availableTemplates.sort(() => 0.5 - Math.random()).slice(0, 15);
-
   const candidatePairs = [];
   for (const item of sampledTemplates) {
     const varsToTest = item.unusedVars.sort(() => 0.5 - Math.random()).slice(0, 2);
@@ -141,7 +150,9 @@ async function nextQuestion() {
     }
   }
 
-  // 3. Parallelize tally queries and evaluate split balance
+  console.log(`📊 [Entropy] Testing ${candidatePairs.length} question candidates across ${sampledTemplates.length} categories...`);
+
+  // 3. Evaluate split efficiency
   const currentAliveIds = new Set(alivePokemon.map(p => p.pokemon_id));
 
   const evaluations = await Promise.all(
@@ -150,7 +161,7 @@ async function nextQuestion() {
       const tallyData = await fetchTalliesForQuestion(candidate.question.question_id, varVal);
 
       if (!tallyData || tallyData.length === 0) {
-        return { candidate, score: Infinity, tallyData: null };
+        return { candidate, score: Infinity, tallyData: null, yesCount: 0, noCount: 0 };
       }
 
       let yesCount = 0;
@@ -167,15 +178,16 @@ async function nextQuestion() {
         }
       }
 
-      // Ignore questions that do not eliminate any alive candidates
       if (yesCount === 0 || noCount === 0) {
-        return { candidate, score: Infinity, tallyData };
+        return { candidate, score: Infinity, tallyData, yesCount, noCount };
       }
 
       return {
         candidate,
         score: Math.abs(yesCount - noCount),
-        tallyData
+        tallyData,
+        yesCount,
+        noCount
       };
     })
   );
@@ -189,8 +201,10 @@ async function nextQuestion() {
     let best = validEvals.reduce((prev, curr) => (curr.score < prev.score ? curr : prev));
     bestQuestion = best.candidate;
     bestTallyData = best.tallyData;
+    console.log(`💡 [Selected Question] "Q${bestQuestion.question.question_id}: ${bestQuestion.question.template_text}" (Variable: ${bestQuestion.variable ? bestQuestion.variable.variable_value : 'none'}) | Split Projection -> YES: ${best.yesCount}, NO: ${best.noCount} | Imbalance Score: ${best.score}`);
   } else {
     bestQuestion = candidatePairs[Math.floor(Math.random() * candidatePairs.length)];
+    console.log(`⚠️ [Entropy Fallback] No perfect split found. Selected fallback question: Q${bestQuestion.question.question_id}`);
   }
 
   askedQuestions.add(bestQuestion.key);
@@ -214,14 +228,13 @@ async function nextQuestion() {
 
 function makeGuess() {
   if (alivePokemon.length === 0) {
-    document.getElementById("game-area").innerHTML = `
-      <div class="guess-box">I'm stumped! I don't know this Pokémon.</div>
-      <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
-    `;
+    promptForCorrectPokemon("I ran out of candidates!");
     return;
   }
 
   currentGuess = alivePokemon[0];
+  console.log(`🤔 [Guess Phase] Guessing: ${currentGuess.name.toUpperCase()} (ID: ${currentGuess.pokemon_id})`);
+  
   document.getElementById("game-area").innerHTML = `
     <div style="font-size: 1.2rem; margin-bottom: 1rem;">Is your Pokémon...</div>
     <div class="guess-box" style="font-size: 1.8rem; color: #3b82f6; text-transform: uppercase;">
@@ -236,31 +249,93 @@ function makeGuess() {
 
 async function handleGuessResult(isCorrect) {
   if (isCorrect) {
+    console.log(`🎉 [Win] Successfully guessed ${currentGuess.name.toUpperCase()} in ${turnCount} turns!`);
     document.getElementById("game-area").innerHTML = `
       <div class="guess-box" style="color: #4ade80;">I guessed it in ${turnCount} questions!</div>
       <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
     `;
   } else {
-    // Remove rejected candidate
+    console.log(`❌ [Incorrect Guess] User rejected ${currentGuess.name.toUpperCase()}. Removing candidate.`);
     alivePokemon = alivePokemon.filter(p => p.pokemon_id !== currentGuess.pokemon_id);
     document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
     
     if (alivePokemon.length === 0) {
-      document.getElementById("game-area").innerHTML = `
-        <div class="guess-box" style="color: #ef4444;">I ran out of candidates! You win!</div>
-        <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
-      `;
+      promptForCorrectPokemon("I ran out of candidates!");
     } else {
-      // Extend question phase by 5 turns before guessing again
       maxQuestionsThreshold = turnCount + 5;
+      console.log(`🔄 [Resuming Game] Questions threshold extended to ${maxQuestionsThreshold}. Asking more questions...`);
       restoreGameUI();
       nextQuestion();
     }
   }
 }
 
+function promptForCorrectPokemon(titleReason) {
+  console.log("📝 [Feedback Prompt] Presenting Pokémon selection UI to update tallies...");
+  
+  // Sort list alphabetically for easier scrolling
+  const sortedOptions = [...allPokemonMasterList].sort((a, b) => a.name.localeCompare(b.name));
+  
+  let optionsHTML = sortedOptions.map(p => `<option value="${p.pokemon_id}">${p.name.replace(/-/g, ' ').toUpperCase()}</option>`).join('');
+
+  document.getElementById("game-area").innerHTML = `
+    <div class="guess-box" style="color: #ef4444; margin-bottom: 1rem;">${titleReason}</div>
+    <p style="margin-bottom: 1rem;">Which Pokémon were you thinking of?</p>
+    <select id="pokemon-select" style="width: 80%; padding: 10px; border-radius: 6px; background: #2a2a2a; color: white; font-size: 1rem;">
+      ${optionsHTML}
+    </select>
+    <br/>
+    <button onclick="submitTargetPokemonCorrection()" style="margin-top: 1.5rem;">Submit & Update Database</button>
+  `;
+}
+
+async function submitTargetPokemonCorrection() {
+  const selectElem = document.getElementById("pokemon-select");
+  const selectedPokemonId = parseInt(selectElem.value, 10);
+  const selectedPokemonObj = allPokemonMasterList.find(p => p.pokemon_id === selectedPokemonId);
+  const name = selectedPokemonObj ? selectedPokemonObj.name.toUpperCase() : "selected Pokémon";
+
+  document.getElementById("game-area").innerHTML = `<div class="guess-box">Updating tallies for ${name}...</div>`;
+
+  // Build RPC payload from session history
+  const payload = sessionHistory.map(entry => ({
+    pokemon_id: selectedPokemonId,
+    question_id: entry.question_id,
+    variable_value: entry.variable_value,
+    yes_count: entry.userChoice === 'yes' ? 10 : 0,
+    no_count: entry.userChoice === 'no' ? 10 : 0
+  }));
+
+  console.log(`⬆️ [Updating Database] Sending ${payload.length} tally updates for Pokémon ID ${selectedPokemonId} (${name}) via add_tallies RPC...`, payload);
+
+  if (payload.length > 0) {
+    const { error } = await dbClient.rpc("add_tallies", { payload });
+    if (error) {
+      console.error("❌ [Database Error] Failed to update tallies:", error);
+    } else {
+      console.log("✅ [Database Updated] Tallies successfully updated!");
+    }
+  }
+
+  document.getElementById("game-area").innerHTML = `
+    <div class="guess-box" style="color: #4ade80;">Thanks! Dexter has updated its database for ${name}.</div>
+    <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
+  `;
+}
+
 async function submitAnswer(userChoice) {
   if (!currentQuestion) return;
+
+  console.log(`👉 [User Answer] Question Q${currentQuestion.question_id} (${currentQuestion.variable_value}) -> Choice: ${userChoice.toUpperCase()}`);
+
+  // Track in session history for database feedback
+  if (userChoice !== 'dont_know') {
+    sessionHistory.push({
+      question_id: currentQuestion.question_id,
+      variable_value: currentQuestion.variable_value,
+      userChoice
+    });
+  }
 
   let tallyData = currentQuestion.cachedTally;
 
@@ -270,6 +345,7 @@ async function submitAnswer(userChoice) {
 
   if (tallyData && tallyData.length > 0 && userChoice !== 'dont_know') {
     const targetMap = new Map(tallyData.map(t => [t.pokemon_id, t]));
+    const prevCount = alivePokemon.length;
 
     alivePokemon = alivePokemon.filter(p => {
       const tally = targetMap.get(p.pokemon_id);
@@ -279,6 +355,8 @@ async function submitAnswer(userChoice) {
       const yesRatio = total > 0 ? tally.yes_count / total : 0.5;
       return userChoice === 'yes' ? yesRatio >= 0.5 : yesRatio < 0.5;
     });
+
+    console.log(`📉 [Candidate Filter] Reduced alive candidates from ${prevCount} down to ${alivePokemon.length}.`);
   }
 
   document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
