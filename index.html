@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dexter - Pokémon Decision Engine</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body { font-family: sans-serif; background: #121212; color: #fff; text-align: center; padding: 2rem; }
+    #card { background: #1e1e1e; border-radius: 12px; padding: 2rem; max-width: 480px; margin: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+    button { background: #3b82f6; color: white; border: none; padding: 12px 20px; margin: 6px; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    .guess-box { font-size: 1.4rem; font-weight: bold; color: #4ade80; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <div id="card">
+    <h1>Dexter</h1>
+    <p id="candidate-count">Alive Candidates: 1025</p>
+    <hr style="border-color: #333; margin: 1.5rem 0;" />
+    
+    <div id="game-area">
+      <h2 id="question-text">Loading question engine...</h2>
+      <div id="button-group">
+        <button onclick="submitAnswer('yes')">Yes</button>
+        <button onclick="submitAnswer('no')">No</button>
+        <button onclick="submitAnswer('dont_know')">Don't Know</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
