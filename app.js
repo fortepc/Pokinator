@@ -22,7 +22,10 @@ async function initGame() {
   askedQuestions.clear();
   
   // 1. Fetch all Pokemon
-  const { data: pData, error: pErr } = await dbClient.from('pokemon').select('pokemon_id, name');
+  const { data: pData, error: pErr } = await dbClient
+  .from('pokemon')
+  .select('pokemon_id, name')
+  .range(0, 2000);
   if (pErr) console.error("Pokemon Fetch Error:", pErr);
   alivePokemon = pData || [];
 
