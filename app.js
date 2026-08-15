@@ -9,30 +9,64 @@ let questionVariables = [];
 let currentQuestion = null;
 let currentGuess = null;
 let turnCount = 0;
+let maxQuestionsThreshold = 25;
 
-const MAX_QUESTIONS = 25;
 const askedQuestions = new Set();
+
+// Paginated fetch to bypass Supabase's default 1,000-row API cap
+async function fetchAllPokemon() {
+  let allRows = [];
+  let page = 0;
+  const pageSize = 1000;
+  while (true) {
+    const { data, error } = await dbClient
+      .from('pokemon')
+      .select('pokemon_id, name')
+      .range(page * pageSize, (page + 1) * pageSize - 1);
+    if (error || !data || data.length === 0) break;
+    allRows = allRows.concat(data);
+    if (data.length < pageSize) break;
+    page++;
+  }
+  return allRows;
+}
+
+// Paginated tally fetch
+async function fetchTalliesForQuestion(questionId, varVal) {
+  let allTallies = [];
+  let page = 0;
+  const pageSize = 1000;
+  while (true) {
+    const { data, error } = await dbClient
+      .from('pokemon_question_tallies')
+      .select('pokemon_id, yes_count, no_count')
+      .eq('question_id', questionId)
+      .eq('variable_value', varVal)
+      .range(page * pageSize, (page + 1) * pageSize - 1);
+    if (error || !data || data.length === 0) break;
+    allTallies = allTallies.concat(data);
+    if (data.length < pageSize) break;
+    page++;
+  }
+  return allTallies;
+}
 
 async function initGame() {
   restoreGameUI();
   document.getElementById("question-text").innerText = "Downloading decision database...";
   turnCount = 0;
+  maxQuestionsThreshold = 25;
   askedQuestions.clear();
   
-  // 1. Fetch all Pokemon (up to 2000 entries)
-  const { data: pData, error: pErr } = await dbClient
-    .from('pokemon')
-    .select('pokemon_id, name')
-    .range(0, 2000);
-  if (pErr) console.error("Pokemon Fetch Error:", pErr);
-  alivePokemon = pData || [];
+  // Fetch ALL Pokemon (bypasses 1,000 row cap)
+  alivePokemon = await fetchAllPokemon();
 
-  // 2. Fetch enabled questions
+  // Fetch enabled questions
   const { data: qData, error: qErr } = await dbClient.from('questions').select('*').eq('enabled_in_game', true);
   if (qErr) console.error("Questions Fetch Error:", qErr);
   questions = qData || [];
 
-  // 3. Fetch variables
+  // Fetch variables
   const { data: vData, error: vErr } = await dbClient.from('question_variables').select('*');
   if (vErr) console.error("Variables Fetch Error:", vErr);
   questionVariables = vData || [];
@@ -55,8 +89,8 @@ function restoreGameUI() {
 async function nextQuestion() {
   turnCount++;
 
-  // Trigger guess if 1 candidate remains, max questions hit, or <= 3 candidates after turn 10
-  if (alivePokemon.length <= 1 || turnCount > MAX_QUESTIONS || (alivePokemon.length <= 3 && turnCount >= 10)) {
+  // Trigger guess if 1 candidate remains or question threshold is reached
+  if (alivePokemon.length <= 1 || turnCount > maxQuestionsThreshold) {
     makeGuess();
     return;
   }
@@ -93,7 +127,7 @@ async function nextQuestion() {
   }
 
   // 2. Sample across DISTINCT question templates
-  const sampledTemplates = availableTemplates.sort(() => 0.5 - Math.random()).slice(0, 12);
+  const sampledTemplates = availableTemplates.sort(() => 0.5 - Math.random()).slice(0, 15);
 
   const candidatePairs = [];
   for (const item of sampledTemplates) {
@@ -107,21 +141,17 @@ async function nextQuestion() {
     }
   }
 
-  // 3. Parallelize tally queries to find the closest 50/50 split
+  // 3. Parallelize tally queries and evaluate split balance
   const currentAliveIds = new Set(alivePokemon.map(p => p.pokemon_id));
 
   const evaluations = await Promise.all(
     candidatePairs.map(async (candidate) => {
       const varVal = candidate.variable ? candidate.variable.variable_value : "none";
+      const tallyData = await fetchTalliesForQuestion(candidate.question.question_id, varVal);
 
-      const { data: tallyData } = await dbClient
-        .from('pokemon_question_tallies')
-        .select('pokemon_id, yes_count, no_count')
-        .eq('question_id', candidate.question.question_id)
-        .eq('variable_value', varVal)
-        .range(0, 2000); // Bypasses default 1,000 cap on tallies
-
-      if (!tallyData) return { candidate, score: Infinity, tallyData: null };
+      if (!tallyData || tallyData.length === 0) {
+        return { candidate, score: Infinity, tallyData: null };
+      }
 
       let yesCount = 0;
       let noCount = 0;
@@ -137,6 +167,11 @@ async function nextQuestion() {
         }
       }
 
+      // Ignore questions that do not eliminate any alive candidates
+      if (yesCount === 0 || noCount === 0) {
+        return { candidate, score: Infinity, tallyData };
+      }
+
       return {
         candidate,
         score: Math.abs(yesCount - noCount),
@@ -145,12 +180,16 @@ async function nextQuestion() {
     })
   );
 
-  let best = evaluations.reduce((prev, curr) => (curr.score < prev.score ? curr : prev), { score: Infinity });
-  let bestQuestion = best.candidate;
-  let bestTallyData = best.tallyData;
+  const validEvals = evaluations.filter(e => e.score !== Infinity);
 
-  // Fallback if no tallies match
-  if (!bestQuestion) {
+  let bestQuestion = null;
+  let bestTallyData = null;
+
+  if (validEvals.length > 0) {
+    let best = validEvals.reduce((prev, curr) => (curr.score < prev.score ? curr : prev));
+    bestQuestion = best.candidate;
+    bestTallyData = best.tallyData;
+  } else {
     bestQuestion = candidatePairs[Math.floor(Math.random() * candidatePairs.length)];
   }
 
@@ -202,6 +241,7 @@ async function handleGuessResult(isCorrect) {
       <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
     `;
   } else {
+    // Remove rejected candidate
     alivePokemon = alivePokemon.filter(p => p.pokemon_id !== currentGuess.pokemon_id);
     document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
     
@@ -211,6 +251,8 @@ async function handleGuessResult(isCorrect) {
         <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
       `;
     } else {
+      // Extend question phase by 5 turns before guessing again
+      maxQuestionsThreshold = turnCount + 5;
       restoreGameUI();
       nextQuestion();
     }
@@ -223,18 +265,10 @@ async function submitAnswer(userChoice) {
   let tallyData = currentQuestion.cachedTally;
 
   if (!tallyData) {
-    const { data, error: tErr } = await dbClient
-      .from('pokemon_question_tallies')
-      .select('pokemon_id, yes_count, no_count')
-      .eq('question_id', currentQuestion.question_id)
-      .eq('variable_value', currentQuestion.variable_value)
-      .range(0, 2000); // Bypasses default 1,000 cap
-
-    if (tErr) console.error("Tally Fetch Error:", tErr);
-    tallyData = data;
+    tallyData = await fetchTalliesForQuestion(currentQuestion.question_id, currentQuestion.variable_value);
   }
 
-  if (tallyData && userChoice !== 'dont_know') {
+  if (tallyData && tallyData.length > 0 && userChoice !== 'dont_know') {
     const targetMap = new Map(tallyData.map(t => [t.pokemon_id, t]));
 
     alivePokemon = alivePokemon.filter(p => {
