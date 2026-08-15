@@ -1,8 +1,6 @@
 const SUPABASE_URL = "https://yckzsnehkugfvecbwheq.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_y2Tika1SdQUWXwyQKyB7AA_6sH2ef-g";
 
-
-
 const dbClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let alivePokemon = [];
@@ -21,11 +19,11 @@ async function initGame() {
   turnCount = 0;
   askedQuestions.clear();
   
-  // 1. Fetch all Pokemon
+  // 1. Fetch all Pokemon (up to 2000 entries)
   const { data: pData, error: pErr } = await dbClient
-  .from('pokemon')
-  .select('pokemon_id, name')
-  .range(0, 2000);
+    .from('pokemon')
+    .select('pokemon_id, name')
+    .range(0, 2000);
   if (pErr) console.error("Pokemon Fetch Error:", pErr);
   alivePokemon = pData || [];
 
@@ -65,7 +63,7 @@ async function nextQuestion() {
 
   document.getElementById("question-text").innerText = "Analyzing candidate entropy...";
 
-  // 1. Group unasked variables by Question Template to prevent moves/abilities from swamping the pool
+  // 1. Group unasked variables by Question Template
   const availableTemplates = [];
   for (const q of questions) {
     const unusedVars = [];
@@ -94,10 +92,9 @@ async function nextQuestion() {
     return;
   }
 
-  // 2. Sample across DISTINCT question templates first (up to 12 different categories)
+  // 2. Sample across DISTINCT question templates
   const sampledTemplates = availableTemplates.sort(() => 0.5 - Math.random()).slice(0, 12);
 
-  // Pick 1-2 random unasked variables per sampled template to test
   const candidatePairs = [];
   for (const item of sampledTemplates) {
     const varsToTest = item.unusedVars.sort(() => 0.5 - Math.random()).slice(0, 2);
@@ -110,46 +107,47 @@ async function nextQuestion() {
     }
   }
 
-  // 3. Find the question/variable pair that splits remaining candidates closest to 50/50
-  let bestQuestion = null;
-  let bestScore = Infinity; 
-  let bestTallyData = null;
+  // 3. Parallelize tally queries to find the closest 50/50 split
   const currentAliveIds = new Set(alivePokemon.map(p => p.pokemon_id));
 
-  for (const candidate of candidatePairs) {
-    const varVal = candidate.variable ? candidate.variable.variable_value : "none";
+  const evaluations = await Promise.all(
+    candidatePairs.map(async (candidate) => {
+      const varVal = candidate.variable ? candidate.variable.variable_value : "none";
 
-    const { data: tallyData } = await dbClient
-      .from('pokemon_question_tallies')
-      .select('pokemon_id, yes_count, no_count')
-      .eq('question_id', candidate.question.question_id)
-      .eq('variable_value', varVal);
+      const { data: tallyData } = await dbClient
+        .from('pokemon_question_tallies')
+        .select('pokemon_id, yes_count, no_count')
+        .eq('question_id', candidate.question.question_id)
+        .eq('variable_value', varVal)
+        .range(0, 2000); // Bypasses default 1,000 cap on tallies
 
-    if (!tallyData) continue;
+      if (!tallyData) return { candidate, score: Infinity, tallyData: null };
 
-    let yesCount = 0;
-    let noCount = 0;
+      let yesCount = 0;
+      let noCount = 0;
 
-    for (const tally of tallyData) {
-      if (currentAliveIds.has(tally.pokemon_id)) {
-        const total = tally.yes_count + tally.no_count;
-        if (total > 0 && (tally.yes_count / total) >= 0.5) {
-          yesCount++;
-        } else {
-          noCount++;
+      for (const tally of tallyData) {
+        if (currentAliveIds.has(tally.pokemon_id)) {
+          const total = tally.yes_count + tally.no_count;
+          if (total > 0 && (tally.yes_count / total) >= 0.5) {
+            yesCount++;
+          } else {
+            noCount++;
+          }
         }
       }
-    }
 
-    // Balance score: absolute difference between YES and NO counts (0 = perfect 50/50 split)
-    const score = Math.abs(yesCount - noCount);
+      return {
+        candidate,
+        score: Math.abs(yesCount - noCount),
+        tallyData
+      };
+    })
+  );
 
-    if (score < bestScore) {
-      bestScore = score;
-      bestQuestion = candidate;
-      bestTallyData = tallyData;
-    }
-  }
+  let best = evaluations.reduce((prev, curr) => (curr.score < prev.score ? curr : prev), { score: Infinity });
+  let bestQuestion = best.candidate;
+  let bestTallyData = best.tallyData;
 
   // Fallback if no tallies match
   if (!bestQuestion) {
@@ -188,7 +186,7 @@ function makeGuess() {
   document.getElementById("game-area").innerHTML = `
     <div style="font-size: 1.2rem; margin-bottom: 1rem;">Is your Pokémon...</div>
     <div class="guess-box" style="font-size: 1.8rem; color: #3b82f6; text-transform: uppercase;">
-      ${currentGuess.name.replace('-', ' ')}?
+      ${currentGuess.name.replace(/-/g, ' ')}?
     </div>
     <div style="margin-top: 1.5rem;">
       <button onclick="handleGuessResult(true)">Yes, that's it!</button>
@@ -204,7 +202,6 @@ async function handleGuessResult(isCorrect) {
       <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
     `;
   } else {
-    // Remove the wrong candidate from alive list
     alivePokemon = alivePokemon.filter(p => p.pokemon_id !== currentGuess.pokemon_id);
     document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
     
@@ -214,7 +211,6 @@ async function handleGuessResult(isCorrect) {
         <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
       `;
     } else {
-      // Restore the gameplay UI and continue asking questions
       restoreGameUI();
       nextQuestion();
     }
@@ -231,7 +227,8 @@ async function submitAnswer(userChoice) {
       .from('pokemon_question_tallies')
       .select('pokemon_id, yes_count, no_count')
       .eq('question_id', currentQuestion.question_id)
-      .eq('variable_value', currentQuestion.variable_value);
+      .eq('variable_value', currentQuestion.variable_value)
+      .range(0, 2000); // Bypasses default 1,000 cap
 
     if (tErr) console.error("Tally Fetch Error:", tErr);
     tallyData = data;
