@@ -1,18 +1,22 @@
 const SUPABASE_URL = "https://yckzsnehkugfvecbwheq.supabase.co";
 const SUPABASE_ANON_KEY = "sb_publishable_y2Tika1SdQUWXwyQKyB7AA_6sH2ef-g";
 
+
+
 const dbClient = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 let alivePokemon = [];
 let questions = [];
 let questionVariables = [];
 let currentQuestion = null;
+let currentGuess = null;
 let turnCount = 0;
 
-const MAX_QUESTIONS = 20;
+const MAX_QUESTIONS = 25;
 const askedQuestions = new Set();
 
 async function initGame() {
+  restoreGameUI();
   document.getElementById("question-text").innerText = "Downloading decision database...";
   turnCount = 0;
   askedQuestions.clear();
@@ -36,10 +40,21 @@ async function initGame() {
   nextQuestion();
 }
 
+function restoreGameUI() {
+  document.getElementById("game-area").innerHTML = `
+    <h2 id="question-text">Analyzing candidate entropy...</h2>
+    <div id="button-group">
+      <button onclick="submitAnswer('yes')">Yes</button>
+      <button onclick="submitAnswer('no')">No</button>
+      <button onclick="submitAnswer('dont_know')">Don't Know</button>
+    </div>
+  `;
+}
+
 async function nextQuestion() {
   turnCount++;
 
-  // Guess triggers: candidate count <= 1, max questions reached, or <= 3 candidates after turn 10
+  // Trigger guess if 1 candidate remains, max questions hit, or <= 3 candidates after turn 10
   if (alivePokemon.length <= 1 || turnCount > MAX_QUESTIONS || (alivePokemon.length <= 3 && turnCount >= 10)) {
     makeGuess();
     return;
@@ -47,41 +62,58 @@ async function nextQuestion() {
 
   document.getElementById("question-text").innerText = "Analyzing candidate entropy...";
 
-  // 1. Build list of all unasked question candidates
-  const unaskedCandidates = [];
+  // 1. Group unasked variables by Question Template to prevent moves/abilities from swamping the pool
+  const availableTemplates = [];
   for (const q of questions) {
+    const unusedVars = [];
     if (q.variable_category !== 'none') {
       const matchingVars = questionVariables.filter(v => v.category === q.variable_category);
       for (const v of matchingVars) {
         const key = `${q.question_id}_${v.variable_value}`;
         if (!askedQuestions.has(key)) {
-          unaskedCandidates.push({ question: q, variable: v, key });
+          unusedVars.push(v);
         }
       }
     } else {
       const key = `${q.question_id}_none`;
       if (!askedQuestions.has(key)) {
-        unaskedCandidates.push({ question: q, variable: null, key });
+        unusedVars.push(null);
       }
+    }
+
+    if (unusedVars.length > 0) {
+      availableTemplates.push({ question: q, unusedVars });
     }
   }
 
-  if (unaskedCandidates.length === 0) {
+  if (availableTemplates.length === 0) {
     makeGuess();
     return;
   }
 
-  // 2. Sample candidate questions to evaluate split efficiency
-  const sampleSize = Math.min(unaskedCandidates.length, 30);
-  const shuffled = unaskedCandidates.sort(() => 0.5 - Math.random()).slice(0, sampleSize);
+  // 2. Sample across DISTINCT question templates first (up to 12 different categories)
+  const sampledTemplates = availableTemplates.sort(() => 0.5 - Math.random()).slice(0, 12);
 
+  // Pick 1-2 random unasked variables per sampled template to test
+  const candidatePairs = [];
+  for (const item of sampledTemplates) {
+    const varsToTest = item.unusedVars.sort(() => 0.5 - Math.random()).slice(0, 2);
+    for (const v of varsToTest) {
+      candidatePairs.push({
+        question: item.question,
+        variable: v,
+        key: `${item.question.question_id}_${v ? v.variable_value : 'none'}`
+      });
+    }
+  }
+
+  // 3. Find the question/variable pair that splits remaining candidates closest to 50/50
   let bestQuestion = null;
-  let bestScore = Infinity; // Lower score = closer to an even 50/50 split
+  let bestScore = Infinity; 
   let bestTallyData = null;
-
   const currentAliveIds = new Set(alivePokemon.map(p => p.pokemon_id));
 
-  for (const candidate of shuffled) {
+  for (const candidate of candidatePairs) {
     const varVal = candidate.variable ? candidate.variable.variable_value : "none";
 
     const { data: tallyData } = await dbClient
@@ -92,7 +124,6 @@ async function nextQuestion() {
 
     if (!tallyData) continue;
 
-    // Count how many currently alive Pokemon would answer YES vs NO
     let yesCount = 0;
     let noCount = 0;
 
@@ -107,7 +138,7 @@ async function nextQuestion() {
       }
     }
 
-    // Split balance score: |yesCount - noCount| (0 is a perfect 50/50 split)
+    // Balance score: absolute difference between YES and NO counts (0 = perfect 50/50 split)
     const score = Math.abs(yesCount - noCount);
 
     if (score < bestScore) {
@@ -119,7 +150,7 @@ async function nextQuestion() {
 
   // Fallback if no tallies match
   if (!bestQuestion) {
-    bestQuestion = unaskedCandidates[Math.floor(Math.random() * unaskedCandidates.length)];
+    bestQuestion = candidatePairs[Math.floor(Math.random() * candidatePairs.length)];
   }
 
   askedQuestions.add(bestQuestion.key);
@@ -142,11 +173,49 @@ async function nextQuestion() {
 }
 
 function makeGuess() {
-  const winner = alivePokemon.length > 0 ? alivePokemon[0].name.toUpperCase() : "UNKNOWN";
+  if (alivePokemon.length === 0) {
+    document.getElementById("game-area").innerHTML = `
+      <div class="guess-box">I'm stumped! I don't know this Pokémon.</div>
+      <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
+    `;
+    return;
+  }
+
+  currentGuess = alivePokemon[0];
   document.getElementById("game-area").innerHTML = `
-    <div class="guess-box">I guess: ${winner}!</div>
-    <button onclick="location.reload()" style="margin-top: 1.5rem;">Play Again</button>
+    <div style="font-size: 1.2rem; margin-bottom: 1rem;">Is your Pokémon...</div>
+    <div class="guess-box" style="font-size: 1.8rem; color: #3b82f6; text-transform: uppercase;">
+      ${currentGuess.name.replace('-', ' ')}?
+    </div>
+    <div style="margin-top: 1.5rem;">
+      <button onclick="handleGuessResult(true)">Yes, that's it!</button>
+      <button onclick="handleGuessResult(false)">No, keep guessing</button>
+    </div>
   `;
+}
+
+async function handleGuessResult(isCorrect) {
+  if (isCorrect) {
+    document.getElementById("game-area").innerHTML = `
+      <div class="guess-box" style="color: #4ade80;">I guessed it in ${turnCount} questions!</div>
+      <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
+    `;
+  } else {
+    // Remove the wrong candidate from alive list
+    alivePokemon = alivePokemon.filter(p => p.pokemon_id !== currentGuess.pokemon_id);
+    document.getElementById("candidate-count").innerText = `Alive Candidates: ${alivePokemon.length}`;
+    
+    if (alivePokemon.length === 0) {
+      document.getElementById("game-area").innerHTML = `
+        <div class="guess-box" style="color: #ef4444;">I ran out of candidates! You win!</div>
+        <button onclick="initGame()" style="margin-top: 1.5rem;">Play Again</button>
+      `;
+    } else {
+      // Restore the gameplay UI and continue asking questions
+      restoreGameUI();
+      nextQuestion();
+    }
+  }
 }
 
 async function submitAnswer(userChoice) {
@@ -154,7 +223,6 @@ async function submitAnswer(userChoice) {
 
   let tallyData = currentQuestion.cachedTally;
 
-  // Fetch tallies if not cached from entropy calculation
   if (!tallyData) {
     const { data, error: tErr } = await dbClient
       .from('pokemon_question_tallies')
@@ -171,7 +239,7 @@ async function submitAnswer(userChoice) {
 
     alivePokemon = alivePokemon.filter(p => {
       const tally = targetMap.get(p.pokemon_id);
-      if (!tally) return true; // Keep if no data recorded
+      if (!tally) return true;
 
       const total = tally.yes_count + tally.no_count;
       const yesRatio = total > 0 ? tally.yes_count / total : 0.5;
